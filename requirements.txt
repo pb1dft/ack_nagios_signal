@@ -1,0 +1,7 @@
+asyncio
+websockets
+requests
+PyYAML
+python-daemon
+systemd-python
+setproctitle

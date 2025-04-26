@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""
+Set vim variables
+vim: set expandtab tabstop=4 shiftwidth=4 softtabstop=4:
+
+Script checked with python3 -m flake8 <script_name>
+"""
+
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+import uuid  # noqa: E402
+
+from config_loader import load_config  # noqa: E402
+
+from daemonize import Daemonize  # noqa: E402
+
+import requests  # noqa: E402
+
+import setproctitle  # noqa: E402
+
+from systemd import journal  # noqa: E402
+
+import user_mgmt  # noqa: E402
+
+import group_mgmt  # noqa: 402
+
+import websockets  # noqa: E402
+
+import yaml  # noqa: E402
+
+config = load_config()
+
+WEBSOCKET_URL = f"{config.get('websocket_url')}/{config.get('signal_number')}"
+PENDING_USERS_FILE = config['pending_users_file']
+
+GROUP_LOOKUP_URL = f"{config.get('signal_api_url')}/v1/groups/{config.get('signal_number')}"
+GROUP_ID_MAP = {}  # Global mapping
+
+# Set program title
+setproctitle.setproctitle('ack_nagios_signal')
+
+pid_file = config.get('pid_file')
+
+
+# --- Setup logger ---
+def setup_logger(foreground=False, loglevel_str='INFO', ident='ack_nagios_signal'):
+    global VALID_LOG_LEVELS
+    loglevel = getattr(logging, loglevel_str.upper(), logging.INFO)
+    logger = logging.getLogger(ident)
+    logger.handlers.clear()
+    logger.setLevel(loglevel)
+    logger.propagate = False
+
+    if foreground:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+    else:
+        handler = journal.JournalHandler()
+        handler.ident = ident
+
+    handler.setLevel(loglevel)
+    logger.addHandler(handler)
+
+    VALID_LOG_LEVELS = sorted(
+        [name for name in dir(logging) if name.isupper() and isinstance(getattr(logging, name), int)],
+        key=lambda level_name: getattr(logging, level_name)
+    )
+    return logger
+
+
+def update_group_id_map_once():
+    global GROUP_ID_MAP
+    try:
+        logger.info('🔄 Updating group ID map...')
+        resp = requests.get(GROUP_LOOKUP_URL)
+        resp.raise_for_status()
+        groups = resp.json()
+
+        updated_map = {}
+        for group in groups:
+            group_id = group.get('id')
+            internal_id = group.get('internal_id')
+            name = group.get('name')
+            if group_id and internal_id:
+                updated_map[internal_id] = {
+                    'id': group_id,
+                    'name': name
+                }
+
+        GROUP_ID_MAP = updated_map
+        logger.info(f'✅ Group ID map updated: {len(GROUP_ID_MAP)} entries.')
+    except Exception as e:
+        logger.info(f'❌ Failed to update group map: {e}')
+
+
+async def update_group_id_map(interval=3600):
+    while True:
+        update_group_id_map_once()
+        await asyncio.sleep(interval)
+
+
+def is_valid_uuid(val):
+    try:
+        uuid.UUID(val.strip())
+        return True
+    except ValueError as e:
+        logger.error(f'UUID check error: {e}')
+        return False
+
+
+def is_valid_group_id(input_str):
+    id_pattern = re.compile(r'^[A-Za-z0-9+/]{43}=$')
+    return bool(id_pattern.fullmatch(input_str))
+
+
+def reload_config():
+    global logger, GROUP_LOOKUP_URL, GROUP_ID_MAP
+    config = load_config()
+
+    # Update GROUP_ID_MAP
+    update_group_id_map_once()
+
+    # Reset logging level to match config
+    logger.setLevel(getattr(logging, config.get('log_level', 'INFO').upper(), logging.INFO))
+    return '🛠️ Config reloaded succesfully', config
+
+
+def send_signal_message(reply_text, envelope):
+    headers = {'Content-Type': 'application/json'}
+    payload = {
+        'message': reply_text,
+        'number': config.get('signal_number')
+    }
+
+    # Check if this was a group message
+    group_id = (
+        envelope.get('dataMessage', {}).get('groupInfo', {}).get('groupId') or envelope.get('syncMessage', {}).get('sentMessage', {}).get('groupInfo', {}).get('groupId')
+    )
+
+    if group_id:
+        payload['recipients'] = [GROUP_ID_MAP[group_id]['id']]
+        group_name = GROUP_ID_MAP[group_id]['name']
+        logger.info(f'📤 Sending group message to group: {group_name} ({group_id})')
+    else:
+        recipient = envelope.get('sourceUuid')
+        if recipient:
+            payload['recipients'] = [recipient]
+            logger.info(f'📤 Sending direct message to: {recipient}')
+        else:
+            logger.info('⚠️ No valid recipient found.')
+            return
+
+    try:
+        response = requests.post(f"{config.get('signal_api_url')}/v2/send", headers=headers, data=json.dumps(payload))
+        response.raise_for_status()
+        logger.debug(f'✅ Message sent: {reply_text}')
+    except requests.exceptions.RequestException as e:
+        logger.info(f'❌ Failed to send message: {e}')
+
+
+def handle_ack_message(envelope):
+    sent_msg = envelope.get('syncMessage', {}).get('sentMessage', {})
+    quote = sent_msg.get('quote', {})
+    quoted_text = quote.get('text', '')
+    user = envelope.get('sourceName', 'Unknown')
+    ack_message = sent_msg.get('message', '')
+
+    comment = re.sub(r'^!ack\s*', '', ack_message).strip()
+
+    # Check for host/service pattern
+    svc_match = re.search(r'^[^\w]*([\w\.\-]+)/([\w\.\-]+):', quoted_text)
+    host_match = re.search(r' ([A-Za-z0-9\.\-\s]+) (\(([0-9]{1,3}\.){3}[0-9]{1,3}\)):', quoted_text)
+
+    try:
+        if svc_match:
+            host = svc_match.group(1)
+            service = svc_match.group(2)
+            msg = f'[{int(time.time())}] ACKNOWLEDGE_SVC_PROBLEM;{host};{service};2;1;0;{user};{comment}\n'
+            # logger.info(f'✔️  {user} acknowledged service issue: {host} / {service}')
+
+        elif host_match:
+            host = host_match.group(1)
+            ip = host_match.group(2)
+            msg = f'[{int(time.time())}] ACKNOWLEDGE_HOST_PROBLEM;{host};1;1;0;{user};{comment}\n'
+            # logger.info('✔️  {user} acknowledged host issue: {host} ({ip})')
+
+        else:
+            send_signal_message('❌ Failed to recognize host/service in quoted message.', envelope)
+            logger.error('❌ Failed to recognize host/service in quoted message.')
+            return
+
+        with open(config.get('nagios_cmd_file'), 'w') as file:
+            file.write(msg)
+
+        # Optional confirmation message
+        smsg = f"🔕 {host} {'/ ' + service if svc_match else ' (' + ip + ')'}:\nAcknowledged by: {user}\n{comment}"
+        logger.info(f"🔕 {host} {'/ ' + service if svc_match else ' (' + ip + ')'}:\nAcknowledged by: {user}\n{comment}")
+        send_signal_message(smsg, envelope)
+
+    except Exception as e:
+        logger.error(f'ACK failed: {e}')
+        send_signal_message('❌ Failed to process ACK command.', envelope)
+
+
+def on_command(argument: str, envelope):
+    name = envelope.get('sourceName', 'Unknown')
+    logger.info(f'✅ Triggered !on command from {name} with argument: {argument}')
+    msg = '[' + str(int(time.time())) + '] ENABLE_NOTIFICATIONS;' + str(int(time.time())) + '\n'
+    file = open(config.get('nagios_cmd_file'), 'w')
+    file.write(msg)
+    file.close()
+    send_signal_message(f'✅ {name} turned on notifications', envelope)
+
+
+def off_command(argument: str, envelope):
+    name = envelope.get('sourceName', 'Unknown')
+    logger.info(f'❌ Triggered !off command from {name} with argument: {argument}')
+    msg = '[' + str(int(time.time())) + '] DISABLE_NOTIFICATIONS;' + str(int(time.time())) + '\n'
+    file = open(config.get('nagios_cmd_file'), 'w')
+    file.write(msg)
+    file.close()
+    send_signal_message(f'❌ {name} turned off notifications', envelope)
+
+
+def handle_chatinfo_command(envelope):
+    sent_msg = envelope.get('dataMessage', {}) or envelope.get('syncMessage', {}).get('sentMessage', {})
+
+    group_info = sent_msg.get('groupInfo', {})
+    group_name = group_info.get('groupName', 'Unknown')
+    group_id = group_info.get('groupId')
+    internal_group_id = GROUP_ID_MAP.get(group_id, {}).get('id', 'Unknown')
+    allowed_groups = config.get('allowed_groups')
+    pending_groups_file = config.get('pending_groups_file')
+
+    new_group = {
+        'name': group_name,
+        'int_id': internal_group_id,
+        'id': group_id
+    }
+
+    if not group_id:
+        send_signal_message('ℹ️ This command must be run from within a group chat.', envelope)
+        return
+
+    # Load existing pending users
+    if os.path.exists(pending_groups_file):
+        with open(pending_groups_file, 'r') as f:
+            data = yaml.safe_load(f) or {}
+    else:
+        data = {}
+
+    pending = data.get('pending_groups', [])
+
+    # Check if the group is already pending
+    if not any(group['int_id'] == internal_group_id for group in pending) and not any(group['int_id'] == internal_group_id for group in allowed_groups) and config['dynamic_group_management']:
+        logger.info(f'🆕 New group requested access via !chatinfo:\n  Name: {group_name}\n  ID: {group_id}\n  Internal ID: {internal_group_id}')
+        pending.append(new_group)
+
+        with open(pending_groups_file, 'w') as f:
+            yaml.dump({'pending_groups': pending}, f)
+    else:
+        logger.debug(data)
+        logger.info(f'📌 Group already pending: {group_name} ({id})')
+
+    reply = f'👥 Group Info:\nGroup Name: {group_name}\nGroup ID: {group_id}\nInternal ID: {internal_group_id}'
+    send_signal_message(reply, envelope)
+
+
+def info_command(envelope):
+    name = envelope.get('sourceName', 'Unknown')
+    number = envelope.get('sourceNumber', 'Unknown')
+    new_uuid = envelope.get('sourceUuid', 'Unknown')
+    allowed_senders = config.get('allowed_senders')
+    pending_users_file = config.get('pending_users_file')
+    new_user = {
+        'name': name,
+        'uuid': new_uuid,
+        'number': number
+    }
+
+    # Load existing pending users
+    if os.path.exists(pending_users_file):
+        with open(pending_users_file, 'r') as f:
+            data = yaml.safe_load(f) or {}
+    else:
+        data = {}
+
+    pending = data.get('pending_users', [])
+
+    # Check if the user is already pending
+    if not any(user['uuid'] == new_uuid for user in pending) and not any(user['uuid'] == new_uuid for user in allowed_senders) and config['dynamic_user_management']:
+        logger.info(f'🆕 New user requested access via !info:\n  Name: {name}\n  UUID: {new_uuid}\n  Number: {number}')
+        pending.append(new_user)
+
+        with open(pending_users_file, 'w') as f:
+            yaml.dump({'pending_users': pending}, f)
+    else:
+        logger.debug(data)
+        logger.info(f'📌 User already pending: {name} ({new_uuid})')
+
+    response = (
+        f'📇 Info:\n'
+        f'Name: {name}\n'
+        f'Number: {number}\n'
+        f'UUID: {new_uuid}'
+    )
+    send_signal_message(response, envelope)
+
+
+def help_command(envelope):
+    response_lines = []
+
+    if config.get('dynamic_group_management', True):
+        response_lines = [
+            '\n👥 Group related commands',
+            '!chatinfo\t\t\t\t\t\t\tWill show the current groups info and add a request to the pending groups lists',
+            '!list_groups\t\t\t\t\t\tList current groups that we accept commands in.',
+            '!pending_groups\t\t\tList pending groupss waiting for approval',
+            '!truncate_groups\t\t\tEmpty pending groups list',
+            '!approve_groups <int>\tApprove the group listed under number <int>',
+            '!remove_groups <id>\t\tRemove a group from the allowed list',
+        ] + response_lines
+
+    if config.get('dynamic_user_management', True):
+        response_lines = [
+            '\n👤 User related commands',
+            '!info\t\t\t\t\t\t\t\t\tWill show your userinfo and add a request to the pending users lists',
+            '!list_users\t\t\t\t\t\tList current users that are able to sent commands',
+            '!pending_users\t\t\t\tList pending users waiting for approval',
+            '!truncate_users\t\t\t\tEmpty pending users list',
+            '!approve_user <int>\t\tApprove the user listed under number <int>',
+            '!remove_user <uuid>\t\tRemove a user from the allowed list',
+        ] + response_lines
+
+    response_lines = [
+        '🖥️ Nagios related commands',
+        '!off <reason>\t\tWill turn off nagios notifications',
+        '!on <reason>\t\tWill turn on nagios notifications',
+        '\nTo acknowledge a nagios alert reply to the alert message with:',
+        '!ack <comment>',
+        '\n🧩 Various commands:',
+        '❓ !help\t\t\t\t\t\t\tShow this help',
+        '📜 !loglevel <level>\t\tTemporary change loglevel',
+        '🔄 !reload\t\t\t\t\t\tReload config from disk'
+    ] + response_lines
+
+    response = '\n'.join(response_lines)
+    logger.info('Sending help to channel or user')
+    send_signal_message(response, envelope)
+
+
+def is_allowed(msg):
+    envelope = msg.get('envelope', {})
+    data_message = envelope.get('dataMessage', {})
+    sync_message = envelope.get('syncMessage', {})
+
+    logger.debug('📩 New message received:')
+    logger.debug(json.dumps(msg, indent=2))
+
+    allowed_senders = config.get('allowed_senders')
+    allowed_groups = config.get('allowed_groups')
+
+    # 🚫 Filter out delivery/read/view receipts
+    if 'receiptMessage' in envelope:
+        return False, True, False
+    if 'typingMessage' in envelope:
+        return False, False, True
+    if 'readMessages' in sync_message:
+        return False, False, True
+
+    source = envelope.get('source')
+    source_uuid = envelope.get('sourceUuid')
+    message_text = data_message.get('message') or sync_message.get('sentMessage', {}).get('message', '')
+    group_id = sync_message.get('sentMessage', {}).get('groupInfo', {}).get('groupId')  # Adjust based on your actual message schema
+
+    # ✅ Always allow !info command, regardless of sender/group
+    if (message_text or '').strip().lower().startswith('!info'):
+        return True, False, False
+
+    # Check group membership (if group_id exists, check allowed_groups)
+    if group_id and allowed_groups and config.get('group_lock'):
+        allowed = False
+        for group in allowed_groups:
+            if group.get('id') == group_id:
+                allowed = True
+                break
+        if not allowed:
+            logger.debug(f'Group {group_id} not in allowed groups, ignoring message')
+            return False, False, False
+
+    if not allowed_senders:
+        logger.info('❌ No Allowed users set, allowing all commands.')
+        return True, False, False
+
+    for user in allowed_senders:
+        if (
+            user.get('number') == source or user.get('uuid') == source_uuid
+        ):
+            return True, False, False
+
+    return False, False, False
+
+
+def handle_command(msg):
+    global config
+    envelope = msg.get('envelope', {})
+
+    # Check message type
+    data_message = envelope.get('dataMessage', {})
+    sync_message = envelope.get('syncMessage', {}).get('sentMessage', {})
+
+    # Prefer dataMessage, fallback to syncMessage
+    message_text = data_message.get('message') or sync_message.get('message')
+
+    # Command detection
+    if (message_text or '').startswith('!on'):
+        argument = message_text[4:].strip()
+        if argument:
+            on_command(argument, envelope)
+        else:
+            send_signal_message('!on command needs an reason', envelope)
+            logger.error('⚠️ No argument provided with !on command.')
+
+    elif (message_text or '').startswith('!off'):
+        argument = message_text[4:].strip()
+        if argument:
+            off_command(argument, envelope)
+        else:
+            send_signal_message('!off command needs an reason', envelope)
+            logger.error('⚠️ No argument provided with !off command.')
+
+    elif (message_text or '').startswith('!help'):
+        help_command(envelope)
+
+    elif (message_text or '').startswith('!info'):
+        info_command(envelope)
+
+    elif (message_text or '').startswith('!chatinfo'):
+        handle_chatinfo_command(envelope)
+
+    elif (message_text or '').startswith('!reload'):
+        response, config = reload_config()
+        send_signal_message(response, envelope)
+
+    elif (message_text or '').startswith('!loglevel'):
+        parts = message_text.strip().split()
+        if len(parts) == 2:
+            level = parts[1].strip().upper()
+            if level in VALID_LOG_LEVELS:
+                logger.setLevel(getattr(logging, level))
+                response = f'📜 Loglevel set to: {level}'
+            else:
+                allowed = ', '.join(VALID_LOG_LEVELS)
+                response = f'❌ Invalid loglevel supplied. Allowed values: {allowed}'
+        else:
+            response = '⚠️ Usage: !loglevel <level>'
+        send_signal_message(response, envelope)
+
+    # User part commands
+    elif (message_text or '').startswith('!pending_users'):
+        if not config['dynamic_user_management']:
+            send_signal_message('❌ Dynamic user management disabled', envelope)
+            return
+        response = user_mgmt.handle_pending_command(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!truncate_users'):
+        if not config['dynamic_user_management']:
+            send_signal_message('❌ Dynamic user management disabled', envelope)
+            return
+        response = user_mgmt.handle_truncate_users_command(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!list_users'):
+        response = user_mgmt.list_allowed_users(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!remove_user'):
+        if not config['dynamic_user_management']:
+            send_signal_message('❌ Dynamic user management disabled', envelope)
+            return
+        parts = message_text.strip().split()
+        if len(parts) == 2 and is_valid_uuid(parts[1]):
+            uuid = parts[1].strip()
+            response, config = user_mgmt.handle_remove_command(uuid, config)
+        else:
+            response = '⚠️ Usage: !remove_user <uuid>'
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!ack'):
+        handle_ack_message(envelope)
+    elif (message_text or '').startswith('!approve_user'):
+        if not config['dynamic_user_management']:
+            send_signal_message('❌ Dynamic user management disabled', envelope)
+            return
+        parts = message_text.strip().split()
+        if len(parts) == 2 and parts[1].isdigit():
+            index = int(parts[1])
+            response, config = user_mgmt.handle_approve_command(index, config)
+        else:
+            response = '⚠️ Usage: !approve_user <number>'
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!pending_groups'):
+        if not config['dynamic_group_management']:
+            send_signal_message('❌ Dynamic group management disabled', envelope)
+            return
+        response = group_mgmt.handle_pending_command(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!truncate_groups'):
+        if not config['dynamic_group_management']:
+            send_signal_message('❌ Dynamic group management disabled', envelope)
+            return
+        response = group_mgmt.handle_truncate_groups_command(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!approve_group'):
+        if not config['dynamic_group_management']:
+            send_signal_message('❌ Dynamic group management disabled', envelope)
+            return
+        parts = message_text.strip().split()
+        if len(parts) == 2 and parts[1].isdigit():
+            index = int(parts[1])
+            response, config = group_mgmt.handle_approve_command(index, config)
+        else:
+            response = '⚠️ Usage: !approve_group <number>'
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!list_groups'):
+        response = group_mgmt.list_allowed_groups(config)
+        send_signal_message(response, envelope)
+    elif (message_text or '').startswith('!remove_group'):
+        if not config['dynamic_group_management']:
+            send_signal_message('❌ Dynamic group management disabled', envelope)
+            return
+        parts = message_text.strip().split()
+        if len(parts) == 2 and is_valid_group_id(parts[1]):
+            ext_id = parts[1].strip()
+            response, config = group_mgmt.handle_remove_command(ext_id, config)
+        else:
+            response = '⚠️ Usage: !remove_group <id>'
+        send_signal_message(response, envelope)
+    else:
+        logger.info('📨 Regular message, no command to handle.')
+
+
+async def receive_messages():
+    async with websockets.connect(WEBSOCKET_URL) as websocket:
+        logger.info(f"🔌 Listening for Signal messages on {config.get('signal_number')}...")
+
+        while True:
+            try:
+                data = await websocket.recv()
+                msg = json.loads(data)
+
+                allowed, is_receipt, is_typing = is_allowed(msg)
+
+                if allowed:
+                    handle_command(msg)
+                elif is_receipt or is_typing:
+                    continue
+                else:
+                    logger.info('⛔ Ignored message from unknown sender or group.')
+
+            except json.JSONDecodeError as e:
+                logger.info(f'❗ JSON error: {e}')
+            except Exception as e:
+                logger.error(f'❗ Unexpected error: {e}')
+                await asyncio.sleep(5)
+
+
+async def main():
+    asyncio.create_task(update_group_id_map())  # Create group updater
+    await receive_messages()  # Create websocket listener
+
+
+# --- Wrap the async main() into a sync function ---
+def run(args):
+    global logger
+    logger = setup_logger(foreground=args.foreground, loglevel_str=args.loglevel)
+    logger.info('Starting async daemon')
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.exception('Daemon crashed: %s', str(e))
+    finally:
+        logger.info('Daemon exiting')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--foreground', action='store_true', help='Run in foreground')
+    parser.add_argument('--loglevel', default='INFO', help='Log level (DEBUG, INFO, WARNING, ERROR)')
+    args, unknown = parser.parse_known_args()
+
+    if unknown:
+        print(f"❌ Unknown arguments: {' '.join(unknown)}\n")
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        if args.foreground:
+            print('🚀 Running in foreground mode')
+            run(args)
+        else:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            with open(os.devnull, 'w') as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
+                os.dup2(devnull.fileno(), sys.stderr.fileno())
+
+            daemon = Daemonize(
+                app="ack_nagios_signal",
+                pid=pid_file,
+                action=lambda: run(args),
+                foreground=False,
+            )
+            daemon.start()
+    except KeyboardInterrupt:
+        print('\n👋 Caught KeyboardInterrupt. Exiting...')
+        sys.exit(0)

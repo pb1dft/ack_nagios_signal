@@ -1,0 +1,47 @@
+# Define the number which is attached to the bot
+signal_number: '+15558675309'
+
+# Define the websocket url to listen for messages
+websocket_url: 'ws://localhost:8080/v1/receive'
+
+# Define the api url to send various commands
+signal_api_url: 'http://localhost:8080'
+
+# Define the nagios cmd file to send commands to nagios
+nagios_cmd_file: '/var/spool/nagios/nagios.cmd'
+
+# Define the pending user file for dynamic user management
+pending_users_file: 'pending_users.yaml'
+
+# Define the pending user file for dynamic user management
+pending_groups_file: 'pending_groups.yaml'
+
+# define pid_fie
+pid_file: '/var/run/ack_nagios-signal.pid'
+
+# Allow dynamic user management
+dynamic_user_management: true
+
+# Allow dynamic group management
+dynamic_group_management: true
+
+# Set the log level (Default: INFO)
+log_level: 'INFO'
+
+# Allowed groups locked
+# Set this to true to lock groups to the list of groups in allowed_groups
+# Since we need to build the groups first and fetch the id set this to false on the first run
+group_lock: true
+
+# Define the list of authorized senders
+# When uuid is unknown start the bot and sent the !info command.
+# Example user format (commented out, do not touch here):
+# allowed_senders:
+#   - name: Jenny Doe / Tommy Tutone
+#     number: +15558675309
+#     uuid: 550e8400-e29b-41d4-a716-446655440000
+allowed_senders:
+[]
+# Define list of groups to receive/process messages in
+allowed_groups:
+[]
