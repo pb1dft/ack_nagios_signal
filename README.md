@@ -61,6 +61,10 @@ The bot supports dynamic management of allowed users and groups, and can be run 
    - dynamic_group_management: true or false
 
 4. Run the bot
+   * Note: when running in venv don't forget to activate it with
+     ```bash
+     source ack_nagios_signal/bin/activate
+     ```
 
    - Foreground (for testing):
      ```bash
@@ -70,7 +74,7 @@ The bot supports dynamic management of allowed users and groups, and can be run 
      ```bash
      ./ack_nagios_signal
      ```
-5. Signals
+6. Signals
 
    To stop the daemon, simply send a termination signal (kill <pid> or Ctrl+C if foreground).
 
@@ -84,9 +88,9 @@ The bot supports dynamic management of allowed users and groups, and can be run 
 | !info | Show your user info and optionally request approval. |
 | !chatinfo | Show group info and optionally request group approval. |
 | !reload | Reload the bot's config from disk. |
-| !loglevel <level> | Temporarily change the bot's log level. |
-| !pending_users, !approve_user <int>, !remove_user <uuid>, truncate_users | Dynamic user management (if enabled). |
-| !pending_groups, !approve_groups <int>, !remove_groups <id>, truncate_groups | Dynamic group management (if enabled). |
+| !loglevel <level> | Temporarily change the bot's log level. |https://github.com/bbernhard/signal-cli-rest-api
+| !pending_users, !approve_user <int>, !remove_user <uuid>, !truncate_users | Dynamic user management (if enabled). |
+| !pending_groups, !approve_groups <int>, !remove_groups <id>, !truncate_groups | Dynamic group management (if enabled). |
 | !help | Get a help message with available commands. |
 
 ## Project Structure
