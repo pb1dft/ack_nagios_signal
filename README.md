@@ -53,8 +53,10 @@ The bot supports dynamic management of allowed users and groups, and can be run 
    - signal_api_url: URL to your Signal API server
    - websocket_url: WebSocket URL for Signal message stream
    - nagios_cmd_file: Path to your Nagios command file (e.g., /var/lib/nagios3/rw/nagios.cmd)
+   - pid_file: Path to your programs pid file (e.g., /var/run/ack_nagios_signal.pid)
    - allowed_senders: List of allowed users (numbers or UUIDs)
    - allowed_groups: List of allowed Signal group IDs
+   - group_lock: When set to true prohibit addition of extra groups (Keep false on first run when you want groups)
    - dynamic_user_management: true or false
    - dynamic_group_management: true or false
 
@@ -83,8 +85,8 @@ The bot supports dynamic management of allowed users and groups, and can be run 
 | !chatinfo | Show group info and optionally request group approval. |
 | !reload | Reload the bot's config from disk. |
 | !loglevel <level> | Temporarily change the bot's log level. |
-| !pending_users, !approve_user <int>, !remove_user <uuid> | Dynamic user management (if enabled). |
-| !pending_groups, !approve_groups <int>, !remove_groups <id> | Dynamic group management (if enabled). |
+| !pending_users, !approve_user <int>, !remove_user <uuid>, truncate_users | Dynamic user management (if enabled). |
+| !pending_groups, !approve_groups <int>, !remove_groups <id>, truncate_groups | Dynamic group management (if enabled). |
 | !help | Get a help message with available commands. |
 
 ## Project Structure
@@ -95,12 +97,13 @@ The bot supports dynamic management of allowed users and groups, and can be run 
 - user_mgmt.py           # Handles user-related actions
 - group_mgmt.py          # Handles group-related actions
 - requirements.txt       # Python dependencies
+- fedora-packages.txt    # Fedora package list
 
 ## Requirements
 
 - Python 3.6+
 - External services:
-  - Signal REST API server (e.g., signal-cli-rest-api)
+  - Signal REST API server (e.g., signal-cli-rest-api (https://github.com/bbernhard/signal-cli-rest-api))
 - Python libraries:
   - asyncio
   - websockets
