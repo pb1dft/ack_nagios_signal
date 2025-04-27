@@ -1,6 +1,6 @@
 asyncio
 websockets
-requests
+requests>=2.32.2
 PyYAML
 python-daemon
 systemd-python
