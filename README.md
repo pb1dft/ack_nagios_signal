@@ -39,6 +39,7 @@ The bot supports dynamic management of allowed users and groups, and can be run 
     ```bash
        git clone https://github.com/pb1dft/ack_nagios_signal/
        cd ack_nagios_signal
+       chmod +x ack_nagios_signal
     ```
   * 2.2 Install Requirements   
     ```bash
