@@ -1,4 +1,7 @@
 import yaml
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 COMMENTS = {
@@ -30,7 +33,7 @@ COMMENTS = {
 }
 
 
-def load_config(path='config.yaml'):
+def load_config(path=os.path.join(BASE_DIR, 'config.yaml')):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
@@ -52,7 +55,7 @@ def indent_lines(text, indent=2):
     return '\n'.join(indentation + line if line.strip() != '' else '' for line in text.splitlines())
 
 
-def save_config(config: dict, path='config.yaml'):
+def save_config(config: dict, path=os.path.join(BASE_DIR, 'config.yaml')):
     lines = []
     for key, value in config.items():
         # Add comment if any
