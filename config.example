@@ -19,6 +19,21 @@ pending_groups_file: 'pending_groups.yaml'
 # define pid_file  (User absolute path)
 pid_file: '/var/run/ack_nagios-signal.pid'
 
+# Define mail server to send mail alerts when connection to rest api is lost
+smtp_server: 'localhost'
+
+# Define mail port
+smtp_port: '25'
+
+# Define email from address
+alert_email_from: 'root@localhost'
+
+# Define email to address
+alert_email_to: 'root@localhost'
+
+# Define the amount of seconds to wait before sending an email
+reconnect_alert_timeout: 900
+
 # Allow dynamic user management
 dynamic_user_management: true
 

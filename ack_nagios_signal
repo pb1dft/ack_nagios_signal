@@ -12,9 +12,11 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
+import smtplib  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
 import uuid  # noqa: E402
+from email.mime.text import MIMEText  # noqa: E402
 
 from config_loader import load_config  # noqa: E402
 
@@ -130,6 +132,26 @@ def reload_config():
     # Reset logging level to match config
     logger.setLevel(getattr(logging, config.get('log_level', 'INFO').upper(), logging.INFO))
     return '🛠️ Config reloaded succesfully', config
+
+
+async def send_alert_email(subject: str, body: str):
+    """Send alert email if connection failed for too long."""
+    try:
+        smtp_server = config.get('smtp_server', 'localhost')
+        smtp_port = config.get('smtp_port', 25)
+        from_addr = config.get('alert_email_from')
+        to_addr = config.get('alert_email_to')
+
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = from_addr
+        msg['To'] = to_addr
+
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+        logger.info(f'📧 Alert email sent to {to_addr}')
+    except Exception as e:
+        logger.error(f'❗ Failed to send alert email: {e}')
 
 
 def send_signal_message(reply_text, envelope):
@@ -545,31 +567,74 @@ def handle_command(msg):
 
 
 async def receive_messages():
-    async with websockets.connect(WEBSOCKET_URL) as websocket:
-        logger.info(f"🔌 Listening for Signal messages on {config.get('signal_number')}...")
+    reconnect_timeout = config.get('reconnect_alert_timeout', 300)  # seconds before alert
+    reconnect_delay = 1  # initial reconnect delay
+    total_down_time = 0  # total time spent trying to reconnect
+    alert_sent = False  # track if 'down' alert has been sent
 
-        while True:
-            try:
-                data = await websocket.recv()
-                msg = json.loads(data)
+    while True:
+        try:
+            logger.info('🔌 Connecting to Signal WebSocket...')
 
-                allowed, is_receipt, is_typing = is_allowed(msg)
+            reload_config()  # Make sure all config vars are reloaded
 
-                if allowed:
-                    handle_command(msg)
-                elif is_receipt or is_typing:
-                    continue
-                else:
-                    logger.info('⛔ Ignored message from unknown sender or group.')
+            async with websockets.connect(WEBSOCKET_URL) as websocket:
+                logger.info(f"✅ Connected. Listening for Signal messages on {config.get('signal_number')}...")
 
-            except json.JSONDecodeError as e:
-                logger.info(f'❗ JSON error: {e}')
-            except Exception as e:
-                logger.error(f'❗ Unexpected error: {e}')
-                await asyncio.sleep(5)
+                if alert_sent:
+                    # Bot recovered, send recovery email
+                    subject = '✅ Signal Bot Recovered'
+                    body = 'Signal bot successfully reconnected and is back online.'
+                    await send_alert_email(subject, body)
+                    alert_sent = False  # Reset alert status
+                    logger.info('✅ Recovery email sent.')
+
+                total_down_time = 0  # Reset downtime
+                reconnect_delay = 1  # Reset delay
+
+                while True:
+                    try:
+                        data = await websocket.recv()
+                        msg = json.loads(data)
+
+                        allowed, is_receipt, is_typing = is_allowed(msg)
+
+                        if allowed:
+                            handle_command(msg)
+                        elif is_receipt or is_typing:
+                            continue
+                        else:
+                            logger.info('⛔ Ignored message from unknown sender or group.')
+
+                    except websockets.ConnectionClosed:
+                        logger.warning('⚡ WebSocket connection lost inside recv. Reconnecting...')
+                        break
+
+                    except json.JSONDecodeError as e:
+                        logger.info(f'❗ JSON error: {e}')
+                    except Exception as e:
+                        logger.error(f'❗ Error while receiving message: {e}')
+                        break
+
+        except Exception as e:
+            logger.error(f'❗ Unexpected error during connection setup: {e}')
+
+        logger.info(f'🔁 Reconnecting in {reconnect_delay}s...')
+        await asyncio.sleep(reconnect_delay)
+        total_down_time += reconnect_delay
+
+        reconnect_delay = min(reconnect_delay * 2, 30)  # Backoff
+
+        if total_down_time >= reconnect_timeout and not alert_sent:
+            logger.warning(f'⚠️ Unable to reconnect for {total_down_time} seconds. Sending down alert email.')
+            subject = '❌ Signal Bot DOWN'
+            body = f'Signal bot could not reconnect for {total_down_time} seconds.\nPlease check the server or container.'
+            await send_alert_email(subject, body)
+            alert_sent = True  # Avoid multiple alerts until recovered
 
 
 async def main():
+    # group_updater = asyncio.create_task(update_group_id_map())  # Create group updater
     asyncio.create_task(update_group_id_map())  # Create group updater
     await receive_messages()  # Create websocket listener
 
@@ -610,7 +675,7 @@ if __name__ == '__main__':
                 os.dup2(devnull.fileno(), sys.stderr.fileno())
 
             daemon = Daemonize(
-                app="ack_nagios_signal",
+                app='ack_nagios_signal',
                 pid=pid_file,
                 action=lambda: run(args),
                 foreground=False,
