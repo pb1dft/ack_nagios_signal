@@ -1,3 +1,5 @@
+"""Handle group management commands such as approval, removal, and listing of allowed groups."""
+
 import os  # noqa: E402
 
 from config_loader import save_config  # noqa: E402
@@ -6,6 +8,7 @@ import yaml  # noqa: E402
 
 
 def handle_truncate_groups_command(config):
+    """Remove all allowed groups from the configuration."""
     if not os.path.exists(config.get('pending_groups_file')):
         return '📭 No pending groups.'
 
@@ -19,6 +22,7 @@ def handle_truncate_groups_command(config):
 
 
 def handle_pending_command(config):
+    """Display groups that are pending approval."""
     if not os.path.exists(config.get('pending_groups_file')):
         return '📭 No pending groups.'
 
@@ -41,7 +45,7 @@ def handle_pending_command(config):
 
 
 def handle_approve_command(index: int, config: dict):
-
+    """Approve a pending group by its index and move it to the allowed list."""
     with open(config.get('pending_groups_file'), 'r') as f:
         data = yaml.safe_load(f) or {}
 
@@ -78,6 +82,7 @@ def handle_approve_command(index: int, config: dict):
 
 
 def list_allowed_groups(config):
+    """Print the list of currently allowed groups."""
     message_lines = ['✅ Allowed groups:']
     for group in config.get('allowed_groups'):
         name = group.get('name', 'Unknown')
@@ -90,7 +95,7 @@ def list_allowed_groups(config):
 
 
 def handle_remove_command(message_text: str, config: dict):
-
+    """Remove a group from the allowed list based on message text."""
     allowed_groups = config.get('allowed_groups')
     initial_len = len(allowed_groups)
 

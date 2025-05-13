@@ -1,2 +1,5 @@
 config.yaml
 *.swp
+__pycache__
+pending_groups.yaml
+pending_users.yaml

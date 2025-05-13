@@ -1,3 +1,5 @@
+"""Manage user access, including approval, removal, listing, and handling of pending users."""
+
 import os  # noqa: E402
 
 from config_loader import save_config  # noqa: E402
@@ -6,6 +8,7 @@ import yaml  # noqa: E402
 
 
 def handle_truncate_users_command(config: dict):
+    """Remove all allowed users from the configuration."""
     if not os.path.exists(config.get('pending_users_file')):
         return '📭 No pending users.'
 
@@ -19,6 +22,7 @@ def handle_truncate_users_command(config: dict):
 
 
 def handle_pending_command(config: dict):
+    """Display users that are pending approval."""
     if not os.path.exists(config.get('pending_users_file')):
         return '📭 No pending users.'
 
@@ -41,7 +45,7 @@ def handle_pending_command(config: dict):
 
 
 def handle_approve_command(index: int, config: dict):
-
+    """Approve a pending user by index and move them to the allowed list."""
     with open(config.get('pending_users_file'), 'r') as f:
         data = yaml.safe_load(f) or {}
 
@@ -78,6 +82,7 @@ def handle_approve_command(index: int, config: dict):
 
 
 def list_allowed_users(config):
+    """Print the list of currently allowed users."""
     message_lines = ['✅ Allowed users:']
     for user in config.get('allowed_senders'):
         name = user.get('name', 'Unknown')
@@ -90,7 +95,7 @@ def list_allowed_users(config):
 
 
 def handle_remove_command(target_uuid: str, config: dict):
-
+    """Remove a user from the allowed list using their UUID."""
     initial_len = len(config.get('allowed_senders'))
     filtered_users = [user for user in config.get('allowed_senders') if user.get('uuid') != target_uuid]
 

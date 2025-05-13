@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+
 """
-Set vim variables
+Set vim variables for consistent formatting.
+
 vim: set expandtab tabstop=4 shiftwidth=4 softtabstop=4:
 
 Script checked with python3 -m flake8 <script_name>
@@ -8,6 +10,7 @@ Script checked with python3 -m flake8 <script_name>
 
 import argparse  # noqa: E402
 import asyncio  # noqa: E402
+import base64  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import os  # noqa: E402
@@ -20,7 +23,8 @@ from email.mime.text import MIMEText  # noqa: E402
 
 from config_loader import load_config  # noqa: E402
 
-from daemonize import Daemonize  # noqa: E402
+import daemon  # noqa: E402
+from daemon.pidfile import PIDLockFile
 
 import requests  # noqa: E402
 
@@ -52,6 +56,7 @@ pid_file = config.get('pid_file')
 
 # --- Setup logger ---
 def setup_logger(foreground=False, loglevel_str='INFO', ident='ack_nagios_signal'):
+    """Set up and configure the logger based on foreground mode and log level."""
     global VALID_LOG_LEVELS
     loglevel = getattr(logging, loglevel_str.upper(), logging.INFO)
     logger = logging.getLogger(ident)
@@ -74,10 +79,40 @@ def setup_logger(foreground=False, loglevel_str='INFO', ident='ack_nagios_signal
         [name for name in dir(logging) if name.isupper() and isinstance(getattr(logging, name), int)],
         key=lambda level_name: getattr(logging, level_name)
     )
+    logger.info(f'Logger setup to run in {loglevel_str} mode')
+    # Get the current log level
+    current_level = logger.level
+
+    # Translate the level number back to its name
+    level_name = logging.getLevelName(current_level)
+    logger.info(f'Live Log level set to {level_name}')
     return logger
 
 
+def clean_stale_pidfile(pidfile):
+    """Clean pidfile."""
+    if not os.path.exists(pidfile):
+        return
+
+    try:
+        with open(pidfile, 'r') as f:
+            pid = int(f.read().strip())
+
+        # Check if process exists
+        os.kill(pid, 0)
+        print(f'❌ Daemon already running with PID {pid}')
+        exit(1)
+    except ProcessLookupError:
+        # Process not running, remove stale PID file
+        print(f'⚠️ Stale PID file found for PID {pid}. Removing.')
+        os.remove(pidfile)
+    except Exception as e:
+        print(f'❌ Could not read or remove PID file: {e}')
+        exit(1)
+
+
 def update_group_id_map_once():
+    """We need a group mapping to match group id's from messages and being able to reply to them."""
     global GROUP_ID_MAP
     try:
         logger.info('🔄 Updating group ID map...')
@@ -103,12 +138,14 @@ def update_group_id_map_once():
 
 
 async def update_group_id_map(interval=3600):
+    """Continuously update the group ID map at specified intervals."""
     while True:
         update_group_id_map_once()
         await asyncio.sleep(interval)
 
 
 def is_valid_uuid(val):
+    """Check whether the provided value is a valid UUID."""
     try:
         uuid.UUID(val.strip())
         return True
@@ -118,19 +155,21 @@ def is_valid_uuid(val):
 
 
 def is_valid_group_id(input_str):
+    """Validate whether the input string matches the expected group ID pattern."""
     id_pattern = re.compile(r'^[A-Za-z0-9+/]{43}=$')
     return bool(id_pattern.fullmatch(input_str))
 
 
 def reload_config():
+    """Reload global configuration variables."""
     global logger, GROUP_LOOKUP_URL, GROUP_ID_MAP
     config = load_config()
 
     # Update GROUP_ID_MAP
     update_group_id_map_once()
 
-    # Reset logging level to match config
-    logger.setLevel(getattr(logging, config.get('log_level', 'INFO').upper(), logging.INFO))
+    # Reset logging level to match config (disabled this breaks command line argument --loglevel)
+    # logger.setLevel(getattr(logging, config.get('log_level', 'INFO').upper(), logging.INFO))
     return '🛠️ Config reloaded succesfully', config
 
 
@@ -155,6 +194,12 @@ async def send_alert_email(subject: str, body: str):
 
 
 def send_signal_message(reply_text, envelope):
+    """Send a reply message through Signal using the provided envelope."""
+
+    use_auth = config.get('signal_api_use_auth', False)
+    user = config.get('signal_api_user')
+    password = config.get('signal_api_password')
+
     headers = {'Content-Type': 'application/json'}
     payload = {
         'message': reply_text,
@@ -180,7 +225,8 @@ def send_signal_message(reply_text, envelope):
             return
 
     try:
-        response = requests.post(f"{config.get('signal_api_url')}/v2/send", headers=headers, data=json.dumps(payload))
+        auth = (user, password) if use_auth else None
+        response = requests.post(f"{config.get('signal_api_url')}/v2/send", headers=headers, data=json.dumps(payload), auth=auth)
         response.raise_for_status()
         logger.debug(f'✅ Message sent: {reply_text}')
     except requests.exceptions.RequestException as e:
@@ -188,17 +234,20 @@ def send_signal_message(reply_text, envelope):
 
 
 def handle_ack_message(envelope):
-    sent_msg = envelope.get('syncMessage', {}).get('sentMessage', {})
+    """Handle and acknowledge an incoming Signal message."""
+    sent_msg = envelope.get('dataMessage', {}) or envelope.get('syncMessage', {}).get('sentMessage', {})
     quote = sent_msg.get('quote', {})
     quoted_text = quote.get('text', '')
     user = envelope.get('sourceName', 'Unknown')
     ack_message = sent_msg.get('message', '')
 
-    comment = re.sub(r'^!ack\s*', '', ack_message).strip()
+    # comment = re.sub(r'^!ack\s*', '', ack_message).strip()
+    comment = re.sub(r'^!ack\s*', '', ack_message).strip() or 'Reason not given'
 
+    logger.info(f'Comment given is =={comment}==')
     # Check for host/service pattern
-    svc_match = re.search(r'^[^\w]*([\w\.\-]+)/([\w\.\-]+):', quoted_text)
-    host_match = re.search(r' ([A-Za-z0-9\.\-\s]+) (\(([0-9]{1,3}\.){3}[0-9]{1,3}\)):', quoted_text)
+    svc_match = re.search(r'^[^\w]*([\w\.\-]+)/([\w\.\-\s]+):', quoted_text)
+    host_match = re.search(r' ([A-Za-z0-9\.\-\s]+) \((([0-9]{1,3}\.){3}[0-9]{1,3})\):', quoted_text)
 
     try:
         if svc_match:
@@ -222,16 +271,52 @@ def handle_ack_message(envelope):
             file.write(msg)
 
         # Optional confirmation message
-        smsg = f"🔕 {host} {'/ ' + service if svc_match else ' (' + ip + ')'}:\nAcknowledged by: {user}\n{comment}"
+        # smsg = f"🔕 {host} {'/ ' + service if svc_match else ' (' + ip + ')'}:\nAcknowledged by: {user}\n{comment}"
         logger.info(f"🔕 {host} {'/ ' + service if svc_match else ' (' + ip + ')'}:\nAcknowledged by: {user}\n{comment}")
-        send_signal_message(smsg, envelope)
+        # No need to send signal message as that is handled by nagios through notify
+        # send_signal_message(smsg, envelope)
 
     except Exception as e:
         logger.error(f'ACK failed: {e}')
         send_signal_message('❌ Failed to process ACK command.', envelope)
 
 
+def check_notification_status(envelope):
+    """Check and log the status of a received notification."""
+    name = envelope.get('sourceName', 'Unknown')
+    status_file = config.get('nagios_status_file', '/var/spool/nagios/status.dat')
+    notifications_enabled = None
+
+    try:
+        with open(status_file, 'r') as f:
+            in_program_block = False
+            for line in f:
+                line = line.strip()
+                if line == 'programstatus {':
+                    in_program_block = True
+                elif line == '}':
+                    if in_program_block:
+                        break
+                    continue
+                elif in_program_block and line.startswith('enable_notifications='):
+                    value = line.split('=')[1].strip()
+                    notifications_enabled = (value == '1')
+                    break
+    except Exception as e:
+        logger.error(f'❌ Failed to read status file: {e}')
+        send_signal_message(f'❌ {name}, failed to check notification status: {e}', envelope)
+        return
+
+    if notifications_enabled is True:
+        send_signal_message('✅ Notifications are currently *ENABLED*', envelope)
+    elif notifications_enabled is False:
+        send_signal_message('⚠️  Notifications are currently *DISABLED*', envelope)
+    else:
+        send_signal_message('❓ Unable to determine notification status.', envelope)
+
+
 def on_command(argument: str, envelope):
+    """Handle the 'on' command from a Signal message."""
     name = envelope.get('sourceName', 'Unknown')
     logger.info(f'✅ Triggered !on command from {name} with argument: {argument}')
     msg = '[' + str(int(time.time())) + '] ENABLE_NOTIFICATIONS;' + str(int(time.time())) + '\n'
@@ -242,6 +327,7 @@ def on_command(argument: str, envelope):
 
 
 def off_command(argument: str, envelope):
+    """Handle the 'off' command from a Signal message."""
     name = envelope.get('sourceName', 'Unknown')
     logger.info(f'❌ Triggered !off command from {name} with argument: {argument}')
     msg = '[' + str(int(time.time())) + '] DISABLE_NOTIFICATIONS;' + str(int(time.time())) + '\n'
@@ -252,6 +338,7 @@ def off_command(argument: str, envelope):
 
 
 def handle_chatinfo_command(envelope):
+    """Handle the 'chatinfo' command and reply with metadata about the chat."""
     sent_msg = envelope.get('dataMessage', {}) or envelope.get('syncMessage', {}).get('sentMessage', {})
 
     group_info = sent_msg.get('groupInfo', {})
@@ -281,7 +368,9 @@ def handle_chatinfo_command(envelope):
     pending = data.get('pending_groups', [])
 
     # Check if the group is already pending
-    if not any(group['int_id'] == internal_group_id for group in pending) and not any(group['int_id'] == internal_group_id for group in allowed_groups) and config['dynamic_group_management']:
+    if not any(group['int_id'] == internal_group_id for group in pending) \
+            and not any(group['int_id'] == internal_group_id for group in allowed_groups) \
+            and config['dynamic_group_management']:
         logger.info(f'🆕 New group requested access via !chatinfo:\n  Name: {group_name}\n  ID: {group_id}\n  Internal ID: {internal_group_id}')
         pending.append(new_group)
 
@@ -296,6 +385,7 @@ def handle_chatinfo_command(envelope):
 
 
 def info_command(envelope):
+    """Handle the 'info' command and return basic sender information."""
     name = envelope.get('sourceName', 'Unknown')
     number = envelope.get('sourceNumber', 'Unknown')
     new_uuid = envelope.get('sourceUuid', 'Unknown')
@@ -337,6 +427,7 @@ def info_command(envelope):
 
 
 def help_command(envelope):
+    """Handle the 'help' command and return available commands."""
     response_lines = []
 
     if config.get('dynamic_group_management', True):
@@ -365,6 +456,7 @@ def help_command(envelope):
         '🖥️ Nagios related commands',
         '!off <reason>\t\tWill turn off nagios notifications',
         '!on <reason>\t\tWill turn on nagios notifications',
+        '!status\t\t\tWill check current notification status',
         '\nTo acknowledge a nagios alert reply to the alert message with:',
         '!ack <comment>',
         '\n🧩 Various commands:',
@@ -379,6 +471,7 @@ def help_command(envelope):
 
 
 def is_allowed(msg):
+    """Check if sender or group belongs to the allow list."""
     envelope = msg.get('envelope', {})
     data_message = envelope.get('dataMessage', {})
     sync_message = envelope.get('syncMessage', {})
@@ -431,6 +524,7 @@ def is_allowed(msg):
 
 
 def handle_command(msg):
+    """Handle various commands."""
     global config
     envelope = msg.get('envelope', {})
 
@@ -457,6 +551,9 @@ def handle_command(msg):
         else:
             send_signal_message('!off command needs an reason', envelope)
             logger.error('⚠️ No argument provided with !off command.')
+
+    elif (message_text or '').startswith('!status'):
+        check_notification_status(envelope)
 
     elif (message_text or '').startswith('!help'):
         help_command(envelope)
@@ -567,18 +664,30 @@ def handle_command(msg):
 
 
 async def receive_messages():
+    """Receive messages from the websocket."""
     reconnect_timeout = config.get('reconnect_alert_timeout', 300)  # seconds before alert
     reconnect_delay = 1  # initial reconnect delay
     total_down_time = 0  # total time spent trying to reconnect
     alert_sent = False  # track if 'down' alert has been sent
-
     while True:
         try:
             logger.info('🔌 Connecting to Signal WebSocket...')
 
             reload_config()  # Make sure all config vars are reloaded
 
-            async with websockets.connect(WEBSOCKET_URL) as websocket:
+            websocket_url = f"{config.get('websocket_url')}/{config.get('signal_number')}"
+            use_auth = config.get('signal_api_use_auth', False)
+            user = config.get('signal_api_user')
+            password = config.get('signal_api_password')
+
+            headers = {}
+
+            if use_auth and user and password:
+                credentials = f'{user}:{password}'
+                encoded_credentials = base64.b64encode(credentials.encode()).decode()
+                headers['Authorization'] = f'Basic {encoded_credentials}'
+
+            async with websockets.connect(websocket_url, extra_headers=headers ) as websocket:
                 logger.info(f"✅ Connected. Listening for Signal messages on {config.get('signal_number')}...")
 
                 if alert_sent:
@@ -634,16 +743,17 @@ async def receive_messages():
 
 
 async def main():
-    # group_updater = asyncio.create_task(update_group_id_map())  # Create group updater
+    """Start main script runner."""
     asyncio.create_task(update_group_id_map())  # Create group updater
     await receive_messages()  # Create websocket listener
 
 
-# --- Wrap the async main() into a sync function ---
 def run(args):
+    """Wrap the async main() into a sync function."""
     global logger
+
     logger = setup_logger(foreground=args.foreground, loglevel_str=args.loglevel)
-    logger.info('Starting async daemon')
+    logger.info(f'Starting async daemon ({args.loglevel})')
     try:
         asyncio.run(main())
     except Exception as e:
@@ -668,19 +778,22 @@ if __name__ == '__main__':
             print('🚀 Running in foreground mode')
             run(args)
         else:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            with open(os.devnull, 'w') as devnull:
-                os.dup2(devnull.fileno(), sys.stdout.fileno())
-                os.dup2(devnull.fileno(), sys.stderr.fileno())
-
-            daemon = Daemonize(
-                app='ack_nagios_signal',
-                pid=pid_file,
-                action=lambda: run(args),
-                foreground=False,
-            )
-            daemon.start()
+            # sys.stdout.flush()
+            # sys.stderr.flush()
+            # with open(os.devnull, 'w') as devnull:
+            #     os.dup2(devnull.fileno(), sys.stdout.fileno())
+            #     os.dup2(devnull.fileno(), sys.stderr.fileno())
+            try:
+                clean_stale_pidfile(pid_file)
+                print('Starting daemon')
+                with daemon.DaemonContext(
+                    pidfile=PIDLockFile(pid_file),
+                    stdout=open('/var/log/ack_nagios_signal.log', 'a+'),
+                    stderr=open('/var/log/ack_nagios_signal.log', 'a+'),
+                ):
+                    run(args)
+            except Exception as e:
+                print(e)
     except KeyboardInterrupt:
         print('\n👋 Caught KeyboardInterrupt. Exiting...')
         sys.exit(0)

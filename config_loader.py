@@ -1,5 +1,8 @@
-import yaml
+"""Utility functions for loading, saving, and formatting YAML configuration files."""
+
 import os
+
+import yaml
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -8,12 +11,13 @@ COMMENTS = {
     'signal_number': 'Define the number which is attached to the bot',
     'websocket_url': 'Define the websocket url to listen for messages',
     'signal_api_url': 'Define the api url to send various commands',
-    'smtp_server': 'Define mail server to send mail alerts when connection to rest api is lost', 
+    'smtp_server': 'Define mail server to send mail alerts when connection to rest api is lost',
     'smtp_port':  'Define mail port',
     'alert_email_from': 'Define email from address',
     'alert_email_to': 'Define email to address',
     'reconnect_alert_timeout': 'Define the amount of seconds to wait before sending an email',
     'nagios_cmd_file': 'Define the nagios cmd file to send commands to nagios (Use absolute path)',
+    'nagios_status_file': 'Define the nagios status file to check the notifaction status',
     'pending_users_file': 'Define the pending user file for dynamic user management (Use absolute path)',
     'pending_groups_file': 'Define the pending user file for dynamic user management (Use absolute path)',
     'pid_file': 'Define the pid file for daemon process (Use absolute path)',
@@ -39,6 +43,7 @@ COMMENTS = {
 
 
 def load_config(path=os.path.join(BASE_DIR, 'config.yaml')):
+    """Load configuration data from a YAML file."""
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
@@ -56,11 +61,13 @@ def write_comment_block(comment):
 
 
 def indent_lines(text, indent=2):
+    """Indent each line of the given text by the specified number of spaces."""
     indentation = ' ' * indent
     return '\n'.join(indentation + line if line.strip() != '' else '' for line in text.splitlines())
 
 
 def save_config(config: dict, path=os.path.join(BASE_DIR, 'config.yaml')):
+    """Save the configuration dictionary to a YAML file."""
     lines = []
     for key, value in config.items():
         # Add comment if any
