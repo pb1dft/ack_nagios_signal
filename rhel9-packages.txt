@@ -1,0 +1,6 @@
+python3-websockets
+python3-requests
+python3-PyYAML
+python3-daemon.noarch
+python3-systemd.x86_64
+python3-setproctitle
