@@ -67,8 +67,6 @@ group_lock: true
 #   - name: Jenny Doe / Tommy Tutone
 #     number: +15558675309
 #     uuid: 550e8400-e29b-41d4-a716-446655440000
-allowed_senders:
-[]
+allowed_senders: []
 # Define list of groups to receive/process messages in
-allowed_groups:
-[]
+allowed_groups: []
